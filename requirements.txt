@@ -1,0 +1,7 @@
+streamlit==1.25.0
+yfinance==0.2.50
+pinecone-client==5.0.1
+python-dotenv==1.0.0
+openai==1.57.1
+transformers==4.47.0
+torch==2.0.1
