@@ -20,10 +20,22 @@ client = OpenAI(
 # Initialize Pinecone client
 pc = Pinecone(api_key=pinecone_api_key)
 
+
+# Load Hugging Face model for embedding
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-mpnet-base-v2")
+model = AutoModel.from_pretrained("sentence-transformers/all-mpnet-base-v2")
+
+
+def get_embeddings(query):
+    inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=128)
+    with torch.no_grad():
+        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
+    return embeddings.squeeze().numpy()
+
 # Ensure the index exists
-if "stocks-index" not in pc.list_indexes().names():
+if "stocks" not in pc.list_indexes().names():
     pc.create_index(
-        name="stocks-index",
+        name="stocks",
         dimension=768, 
         metric="cosine",
         spec=ServerlessSpec(
@@ -32,17 +44,7 @@ if "stocks-index" not in pc.list_indexes().names():
         )
     )
 
-pinecone_index = pc.Index("stocks-index")
-
-# Load Hugging Face model for embedding
-tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-
-def get_embeddings(query):
-    inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=128)
-    with torch.no_grad():
-        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
-    return embeddings.squeeze().numpy()
+pinecone_index = pc.Index("stocks")
 
 # Streamlit App Title
 st.title("StockView")
@@ -65,60 +67,90 @@ if st.button("Search"):
         # Build Filters for Pinecone Query
         filters = {}
         if sector != "All":
-            filters["sector"] = sector  # Add sector filter if it's not "All"
+            filters["Sector"] = sector  # Use "Sector" exactly as it appears in your metadata
 
         # Query Pinecone for Stocks in the Sector
         results = pinecone_index.query(
             vector=raw_query_embedding.tolist(),
-            top_k=50, 
+            top_k=50,  # Fetch more results to apply additional filtering
             include_metadata=True,
-            namespace="stocks",
-            filter=filters 
+            namespace="stock-descriptions",  # Update based on your namespace
+            filter=filters  # Apply sector filter
         )
+        st.write(f"Filters applied: {filters}")
+        st.write(f"Number of matches from Pinecone: {len(results['matches'])}")
+        # st.write(results)  # This will display the raw response for debugging
 
-        # Fetch Market Cap for Each Stock
+
+
+
+        # Ensure no duplicates in filtered_stocks
         filtered_stocks = []
+        unique_tickers = set()
+        slider_min, slider_max = market_cap
+
         for match in results["matches"]:
             metadata = match["metadata"]
-            stock_ticker = metadata.get("Ticker") 
+            stock_ticker = metadata.get("Ticker")
+            if not stock_ticker or stock_ticker in unique_tickers:
+                continue  # Skip duplicates or entries without tickers
+
             try:
-                # Fetch stock data using yfinance
                 stock = yf.Ticker(stock_ticker)
                 stock_info = stock.info
-                market_cap = stock_info.get("marketCap", None)
+                market_cap = stock_info.get("marketCap")
 
-                # Check if Market Cap is within the selected range
-                if market_cap and market_cap >= market_cap[0] * 1e9 and market_cap <= market_cap[1] * 1e9:
+                # Apply Market Cap filter
+                if market_cap and slider_min * 1e9 <= market_cap <= slider_max * 1e9:
                     filtered_stocks.append({
-                        "name": stock_ticker,
-                        "sector": metadata.get("sector", "Unknown"),
+                        "name": metadata.get("Name", "Unknown"),
+                        "sector": metadata.get("Sector", "Unknown"),
                         "market_cap": market_cap,
-                        "business_summary": metadata.get("Business Summary", "No summary available")
+                        "ticker": stock_ticker,
+                        "business_summary": metadata.get("Business Summary", "No summary available"),
                     })
+                    unique_tickers.add(stock_ticker)  # Track seen tickers
+
             except Exception as e:
-                st.write(f"Error fetching data for {stock_ticker}: {e}")
                 continue
 
         # Display Filtered Results
         st.subheader("Top Matches")
         if filtered_stocks:
+            st.write(f"Found {len(filtered_stocks)} matching stocks within the market cap range {slider_min}B - {slider_max}B.")
+
+            # Display a compact summary of filtered stocks
             for stock in filtered_stocks:
-                st.write(f"**Company Name:** {stock['name']}")
-                st.write(f"**Sector:** {stock['sector']}")
-                st.write(f"**Market Cap:** {stock['market_cap'] / 1e9:.2f}B")
-                st.write(f"**Business Summary:** {stock['business_summary']}")
-                st.write("---")
+                st.write(f"- **{stock['name']}** ({stock['sector']}) | Ticker: {stock['ticker']} | Market Cap: {stock['market_cap'] / 1e9:.2f}B")
+
+            # Add collapsible details for each stock
+            for stock in filtered_stocks:
+                with st.expander(f"Details for {stock['name']}"):
+                    st.write(f"**Sector:** {stock['sector']}")
+                    st.write(f"**Ticker:** {stock['ticker']}")
+                    st.write(f"**Market Cap:** {stock['market_cap'] / 1e9:.2f}B")
+                    st.write(f"**Business Summary:** {stock['business_summary']}")
+        
+            # Pass Filtered Stocks to OpenAI for Enhanced AI Report
+            pinecone_stock_list = ", ".join([f"{stock['name']} (Ticker: {stock['ticker']}, Sector: {stock['sector']}, Market Cap: {stock['market_cap'] / 1e9:.2f}B)" for stock in filtered_stocks])
+            ai_query = f"Generate a financial report for the following companies: {pinecone_stock_list}. Include their sectors, financial performance, and any relevant recommendations."
+
+            try:
+                # Generate AI Report using OpenAI
+                response = client.chat.completions.create(
+                    model="llama-3.2-3b-preview",
+                    messages=[
+                        {"role": "system", "content": "You are a financial analysis assistant."},
+                        {"role": "user", "content": ai_query}
+                    ]
+                )
+
+                # Display AI-generated report
+                st.subheader("AI-Generated Report")
+                st.write(response.choices[0].message.content)
+
+            except Exception as e:
+                st.error(f"Error generating AI report: {e}")
         else:
-            st.write("No stocks found matching the criteria.")
+            st.write(f"No stocks found matching the criteria within the market cap range {slider_min}B - {slider_max}B.")
 
-        response = client.chat.completions.create(
-            model="llama-3.2-3b-preview",
-            messages=[
-                {"role": "system", "content": "You are a financial analysis assistant."},
-                {"role": "user", "content": f"Generate a financial report for companies related to: {query}"}
-            ]
-        )
-
-        # Display AI-generated report
-        st.subheader("AI-Generated Report")
-        st.write(response.choices[0].message.content)
